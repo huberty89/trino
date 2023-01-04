@@ -28,6 +28,7 @@ public class SqlServerSessionProperties
 {
     public static final String BULK_COPY_FOR_WRITE = "bulk_copy_for_write";
     public static final String BULK_COPY_FOR_WRITE_LOCK_DESTINATION_TABLE = "bulk_copy_for_write_lock_destination_table";
+    public static final String ENABLE_STRING_PUSHDOWN_WITH_COLLATE = "enable_string_pushdown_with_collate";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -44,6 +45,11 @@ public class SqlServerSessionProperties
                         BULK_COPY_FOR_WRITE_LOCK_DESTINATION_TABLE,
                         "Obtain a Bulk Update lock on destination table on write",
                         config.isBulkCopyForWriteLockDestinationTable(),
+                        false),
+                booleanProperty(
+                        ENABLE_STRING_PUSHDOWN_WITH_COLLATE,
+                        "Enable string pushdown with collate (experimental)",
+                        config.isEnableStringPushdownWithCollate(),
                         false));
     }
 
@@ -66,5 +72,10 @@ public class SqlServerSessionProperties
     public static boolean isBulkCopyForWriteLockDestinationTable(ConnectorSession session)
     {
         return session.getProperty(BULK_COPY_FOR_WRITE_LOCK_DESTINATION_TABLE, Boolean.class);
+    }
+
+    public static boolean isEnableStringPushdownWithCollate(ConnectorSession session)
+    {
+        return session.getProperty(ENABLE_STRING_PUSHDOWN_WITH_COLLATE, Boolean.class);
     }
 }

@@ -22,6 +22,8 @@ public class SqlServerConfig
     private boolean bulkCopyForWrite;
     private boolean bulkCopyForWriteLockDestinationTable;
 
+    private boolean enableStringPushdownWithCollate;
+
     public boolean isBulkCopyForWrite()
     {
         return bulkCopyForWrite;
@@ -59,5 +61,16 @@ public class SqlServerConfig
     {
         this.snapshotIsolationDisabled = snapshotIsolationDisabled;
         return this;
+    }
+
+    public boolean isEnableStringPushdownWithCollate()
+    {
+        return enableStringPushdownWithCollate;
+    }
+
+    @Config("sqlserver.experimental.enable-string-pushdown-with-collate")
+    public void setEnableStringPushdownWithCollate(boolean enableStringPushdownWithCollate)
+    {
+        this.enableStringPushdownWithCollate = enableStringPushdownWithCollate;
     }
 }

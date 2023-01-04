@@ -20,9 +20,15 @@ import io.trino.plugin.jdbc.BaseJdbcConnectorTest;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.spi.connector.ColumnHandle;
+import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.predicate.Domain;
+import io.trino.spi.predicate.Range;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.sql.planner.assertions.PlanMatchPattern;
+import io.trino.sql.planner.plan.ExchangeNode;
 import io.trino.sql.planner.plan.FilterNode;
+import io.trino.sql.planner.plan.JoinNode;
+import io.trino.sql.planner.plan.TableScanNode;
 import io.trino.testing.TestingConnectorBehavior;
 import io.trino.testing.sql.TestTable;
 import io.trino.testng.services.Flaky;
@@ -33,15 +39,24 @@ import org.testng.annotations.Test;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.stream.Stream;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.MoreCollectors.onlyElement;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.plugin.sqlserver.DataCompression.NONE;
 import static io.trino.plugin.sqlserver.DataCompression.PAGE;
 import static io.trino.plugin.sqlserver.DataCompression.ROW;
 import static io.trino.spi.type.VarcharType.createVarcharType;
+import static io.trino.sql.planner.assertions.PlanMatchPattern.anyTree;
+import static io.trino.sql.planner.assertions.PlanMatchPattern.exchange;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.node;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.tableScan;
+import static io.trino.testing.TestingConnectorBehavior.SUPPORTS_AGGREGATION_PUSHDOWN;
+import static io.trino.testing.TestingConnectorBehavior.SUPPORTS_JOIN_PUSHDOWN_WITH_FULL_JOIN;
+import static io.trino.testing.TestingConnectorBehavior.SUPPORTS_LIMIT_PUSHDOWN;
+import static io.trino.testing.TestingConnectorBehavior.SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_EQUALITY;
+import static io.trino.testing.TestingConnectorBehavior.SUPPORTS_TOPN_PUSHDOWN;
 import static io.trino.testing.TestingNames.randomNameSuffix;
 import static java.lang.String.format;
 import static java.util.stream.Collectors.joining;
@@ -340,6 +355,215 @@ public abstract class BaseSqlServerConnectorTest
                     .isFullyPushedDown();
             assertThat(query("SELECT * FROM " + testTable.getName() + " WHERE long_decimal = 123456789.987654321"))
                     .matches("VALUES (CAST(123.321 AS decimal(9,3)), CAST(123456789.987654321 AS decimal(30, 10)))")
+                    .isFullyPushedDown();
+        }
+    }
+
+    @Test
+    public void testStringPushdownWithCollate()
+    {
+        Session session = Session.builder(getSession())
+                .setCatalogSessionProperty("sqlserver", "enable_string_pushdown_with_collate", "true")
+                .build();
+
+        // varchar range
+        assertThat(query(session, "SELECT regionkey, nationkey, name FROM nation WHERE name BETWEEN 'POLAND' AND 'RPA'"))
+                .matches("VALUES (BIGINT '3', BIGINT '19', CAST('ROMANIA' AS varchar(25)))")
+                .isFullyPushedDown();
+
+        // varchar IN with small compaction threshold
+        assertThat(query(
+                Session.builder(session)
+                        .setCatalogSessionProperty("sqlserver", "domain_compaction_threshold", "1")
+                        .build(),
+                "SELECT regionkey, nationkey, name FROM nation WHERE name IN ('POLAND', 'ROMANIA', 'VIETNAM')"))
+                .matches("VALUES " +
+                        "(BIGINT '3', BIGINT '19', CAST('ROMANIA' AS varchar(25))), " +
+                        "(BIGINT '2', BIGINT '21', CAST('VIETNAM' AS varchar(25)))")
+                // Verify that a FilterNode is retained and only a compacted domain is pushed down to connector as a range predicate
+                .isNotFullyPushedDown(node(FilterNode.class, tableScan(
+                        tableHandle -> {
+                            TupleDomain<ColumnHandle> constraint = ((JdbcTableHandle) tableHandle).getConstraint();
+                            ColumnHandle nameColumn = constraint.getDomains().orElseThrow()
+                                    .keySet().stream()
+                                    .map(JdbcColumnHandle.class::cast)
+                                    .filter(column -> column.getColumnName().equals("name"))
+                                    .collect(onlyElement());
+                            return constraint.getDomains().get().get(nameColumn).getValues().getRanges().getOrderedRanges()
+                                    .equals(ImmutableList.of(
+                                            Range.range(
+                                                    createVarcharType(25),
+                                                    utf8Slice("POLAND"), true,
+                                                    utf8Slice("VIETNAM"), true)));
+                        },
+                        TupleDomain.all(),
+                        ImmutableMap.of())));
+
+        // varchar predicate over join
+        Session joinPushdownEnabled = joinPushdownEnabled(session);
+        assertThat(query(joinPushdownEnabled, "SELECT c.name, n.name FROM customer c JOIN nation n ON c.custkey = n.nationkey WHERE address < 'TcGe5gaZNgVePxU5kRrvXBfkasDTea'"))
+                .isFullyPushedDown();
+
+        // join on varchar columns is not pushed down
+        assertThat(query(joinPushdownEnabled, "SELECT c.name, n.name FROM customer c JOIN nation n ON c.address = n.name"))
+                .isNotFullyPushedDown(
+                        node(JoinNode.class,
+                                anyTree(node(TableScanNode.class)),
+                                anyTree(node(TableScanNode.class))));
+    }
+
+    @Test
+    public void testStringJoinPushdownWithCollate()
+    {
+        PlanMatchPattern joinOverTableScans =
+                node(JoinNode.class,
+                        anyTree(node(TableScanNode.class)),
+                        anyTree(node(TableScanNode.class)));
+
+        PlanMatchPattern broadcastJoinOverTableScans =
+                node(JoinNode.class,
+                        node(TableScanNode.class),
+                        exchange(ExchangeNode.Scope.LOCAL,
+                                exchange(ExchangeNode.Scope.REMOTE, ExchangeNode.Type.REPLICATE,
+                                        node(TableScanNode.class))));
+
+        Session sessionWithCollatePushdown = Session.builder(getSession())
+                .setCatalogSessionProperty("sqlserver", "enable_string_pushdown_with_collate", "true")
+                .build();
+
+        Session session = joinPushdownEnabled(sessionWithCollatePushdown);
+
+        // Disable DF here for the sake of negative test cases' expected plan. With DF enabled, some operators return in DF's FilterNode and some do not.
+        Session withoutDynamicFiltering = Session.builder(getSession())
+                .setSystemProperty("enable_dynamic_filtering", "false")
+                .setCatalogSessionProperty("sqlserver", "enable_string_pushdown_with_collate", "true")
+                .build();
+
+        String notDistinctOperator = "IS NOT DISTINCT FROM";
+        List<String> nonEqualities = Stream.concat(
+                        Stream.of(JoinCondition.Operator.values())
+                                .filter(operator -> operator != JoinCondition.Operator.EQUAL)
+                                .map(JoinCondition.Operator::getValue),
+                        Stream.of(notDistinctOperator))
+                .collect(toImmutableList());
+
+        try (TestTable nationLowercaseTable = new TestTable(
+                // If a connector supports Join pushdown, but does not allow CTAS, we need to make the table creation here overridable.
+                getQueryRunner()::execute,
+                "nation_lowercase",
+                "AS SELECT nationkey, lower(name) name, regionkey FROM nation")) {
+            // basic case
+            assertThat(query(session, "SELECT r.name, n.name FROM nation n JOIN region r ON n.regionkey = r.regionkey")).isFullyPushedDown();
+
+            // join over different columns
+            assertThat(query(session, "SELECT r.name, n.name FROM nation n JOIN region r ON n.nationkey = r.regionkey")).isFullyPushedDown();
+
+            // pushdown when using USING
+            assertThat(query(session, "SELECT r.name, n.name FROM nation n JOIN region r USING(regionkey)")).isFullyPushedDown();
+
+            // varchar equality predicate
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT n.name, n2.regionkey FROM nation n JOIN nation n2 ON n.name = n2.name",
+                    true,
+                    joinOverTableScans);
+            assertConditionallyPushedDown(
+                    session,
+                    format("SELECT n.name, nl.regionkey FROM nation n JOIN %s nl ON n.name = nl.name", nationLowercaseTable.getName()),
+                    true,
+                    joinOverTableScans);
+
+            // multiple bigint predicates
+            assertThat(query(session, "SELECT n.name, c.name FROM nation n JOIN customer c ON n.nationkey = c.nationkey and n.regionkey = c.custkey"))
+                    .isFullyPushedDown();
+
+            // inequality
+            for (String operator : nonEqualities) {
+                // bigint inequality predicate
+                assertThat(query(withoutDynamicFiltering, format("SELECT r.name, n.name FROM nation n JOIN region r ON n.regionkey %s r.regionkey", operator)))
+                        // Currently no pushdown as inequality predicate is removed from Join to maintain Cross Join and Filter as separate nodes
+                        .isNotFullyPushedDown(broadcastJoinOverTableScans);
+
+                // varchar inequality predicate
+                assertThat(query(withoutDynamicFiltering, format("SELECT n.name, nl.name FROM nation n JOIN %s nl ON n.name %s nl.name", nationLowercaseTable.getName(), operator)))
+                        // Currently no pushdown as inequality predicate is removed from Join to maintain Cross Join and Filter as separate nodes
+                        .isNotFullyPushedDown(broadcastJoinOverTableScans);
+            }
+
+            // inequality along with an equality, which constitutes an equi-condition and allows filter to remain as part of the Join
+            for (String operator : nonEqualities) {
+                assertConditionallyPushedDown(
+                        session,
+                        format("SELECT n.name, c.name FROM nation n JOIN customer c ON n.nationkey = c.nationkey AND n.regionkey %s c.custkey", operator),
+                        expectJoinPushdown(operator),
+                        joinOverTableScans);
+            }
+
+            // varchar inequality along with an equality, which constitutes an equi-condition and allows filter to remain as part of the Join
+            for (String operator : nonEqualities) {
+                assertConditionallyPushedDown(
+                        session,
+                        format("SELECT n.name, nl.name FROM nation n JOIN %s nl ON n.regionkey = nl.regionkey AND n.name %s nl.name", nationLowercaseTable.getName(), operator),
+                        expectJoinPushdown(operator),
+                        joinOverTableScans);
+            }
+
+            // LEFT JOIN
+            assertThat(query(session, "SELECT r.name, n.name FROM nation n LEFT JOIN region r ON n.nationkey = r.regionkey")).isFullyPushedDown();
+            assertThat(query(session, "SELECT r.name, n.name FROM region r LEFT JOIN nation n ON n.nationkey = r.regionkey")).isFullyPushedDown();
+
+            // RIGHT JOIN
+            assertThat(query(session, "SELECT r.name, n.name FROM nation n RIGHT JOIN region r ON n.nationkey = r.regionkey")).isFullyPushedDown();
+            assertThat(query(session, "SELECT r.name, n.name FROM region r RIGHT JOIN nation n ON n.nationkey = r.regionkey")).isFullyPushedDown();
+
+            // FULL JOIN
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT r.name, n.name FROM nation n FULL JOIN region r ON n.nationkey = r.regionkey",
+                    hasBehavior(SUPPORTS_JOIN_PUSHDOWN_WITH_FULL_JOIN),
+                    joinOverTableScans);
+
+            // Join over a (double) predicate
+            assertThat(query(session, "" +
+                    "SELECT c.name, n.name " +
+                    "FROM (SELECT * FROM customer WHERE acctbal > 8000) c " +
+                    "JOIN nation n ON c.custkey = n.nationkey"))
+                    .isFullyPushedDown();
+
+            // Join over a varchar equality predicate
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT c.name, n.name FROM (SELECT * FROM customer WHERE address = 'TcGe5gaZNgVePxU5kRrvXBfkasDTea') c " +
+                            "JOIN nation n ON c.custkey = n.nationkey",
+                    hasBehavior(SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_EQUALITY),
+                    joinOverTableScans);
+
+            // join over aggregation
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT * FROM (SELECT regionkey rk, count(nationkey) c FROM nation GROUP BY regionkey) n " +
+                            "JOIN region r ON n.rk = r.regionkey",
+                    hasBehavior(SUPPORTS_AGGREGATION_PUSHDOWN),
+                    joinOverTableScans);
+
+            // join over LIMIT
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT * FROM (SELECT nationkey FROM nation LIMIT 30) n " +
+                            "JOIN region r ON n.nationkey = r.regionkey",
+                    hasBehavior(SUPPORTS_LIMIT_PUSHDOWN),
+                    joinOverTableScans);
+
+            // join over TopN
+            assertConditionallyPushedDown(
+                    session,
+                    "SELECT * FROM (SELECT nationkey FROM nation ORDER BY regionkey LIMIT 5) n " +
+                            "JOIN region r ON n.nationkey = r.regionkey",
+                    hasBehavior(SUPPORTS_TOPN_PUSHDOWN),
+                    joinOverTableScans);
+
+            // join over join
+            assertThat(query(session, "SELECT * FROM nation n, region r, customer c WHERE n.regionkey = r.regionkey AND r.regionkey = c.custkey"))
                     .isFullyPushedDown();
         }
     }

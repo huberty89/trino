@@ -41,6 +41,7 @@ import io.trino.plugin.jdbc.LongReadFunction;
 import io.trino.plugin.jdbc.LongWriteFunction;
 import io.trino.plugin.jdbc.ObjectReadFunction;
 import io.trino.plugin.jdbc.ObjectWriteFunction;
+import io.trino.plugin.jdbc.PredicatePushdownController;
 import io.trino.plugin.jdbc.PreparedQuery;
 import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.RemoteTableName;
@@ -64,6 +65,7 @@ import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.connector.JoinStatistics;
 import io.trino.spi.connector.JoinType;
 import io.trino.spi.expression.ConnectorExpression;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.statistics.ColumnStatistics;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
@@ -115,15 +117,16 @@ import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static io.trino.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
 import static io.trino.plugin.jdbc.JdbcJoinPushdownUtil.implementJoinCostAware;
+import static io.trino.plugin.jdbc.JdbcMetadataSessionProperties.getDomainCompactionThreshold;
 import static io.trino.plugin.jdbc.PredicatePushdownController.DISABLE_PUSHDOWN;
+import static io.trino.plugin.jdbc.PredicatePushdownController.FULL_PUSHDOWN;
 import static io.trino.plugin.jdbc.StandardColumnMappings.bigintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.bigintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.booleanColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.booleanWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.charReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.charWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.decimalColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultCharColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultVarcharColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.doubleColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.doubleWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.fromTrinoTime;
@@ -146,11 +149,13 @@ import static io.trino.plugin.jdbc.TypeHandlingJdbcSessionProperties.getUnsuppor
 import static io.trino.plugin.jdbc.UnsupportedTypeHandling.CONVERT_TO_VARCHAR;
 import static io.trino.plugin.sqlserver.SqlServerSessionProperties.isBulkCopyForWrite;
 import static io.trino.plugin.sqlserver.SqlServerSessionProperties.isBulkCopyForWriteLockDestinationTable;
+import static io.trino.plugin.sqlserver.SqlServerSessionProperties.isEnableStringPushdownWithCollate;
 import static io.trino.plugin.sqlserver.SqlServerTableProperties.DATA_COMPRESSION;
 import static io.trino.plugin.sqlserver.SqlServerTableProperties.getDataCompression;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
+import static io.trino.spi.type.CharType.createCharType;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.trino.spi.type.DateTimeEncoding.unpackZoneKey;
@@ -206,6 +211,25 @@ public class SqlServerClient
     private final AggregateFunctionRewriter<JdbcExpression, String> aggregateFunctionRewriter;
 
     private static final int MAX_SUPPORTED_TEMPORAL_PRECISION = 7;
+
+    private static final PredicatePushdownController SQLSERVER_STRING_COLLATION_AWARE_PUSHDOWN = (session, domain) -> {
+        if (domain.isOnlyNull()) {
+            return FULL_PUSHDOWN.apply(session, domain);
+        }
+
+        if (isEnableStringPushdownWithCollate(session)) {
+            return FULL_PUSHDOWN.apply(session, domain);
+        }
+
+        Domain simplifiedDomain = domain.simplify(getDomainCompactionThreshold(session));
+        if (!simplifiedDomain.getValues().isDiscreteSet()) {
+            // Domain#simplify can turn a discrete set into a range predicate
+            // Push down of range predicate for varchar/char types could lead to incorrect results
+            // when the remote database is case insensitive
+            return DISABLE_PUSHDOWN.apply(session, domain);
+        }
+        return new PredicatePushdownController.DomainPushdownResult(simplifiedDomain, domain);
+    };
 
     @Inject
     public SqlServerClient(
@@ -322,6 +346,31 @@ public class SqlServerClient
         if (columnName.length() > databaseMetadata.getMaxColumnNameLength()) {
             throw new TrinoException(NOT_SUPPORTED, format("Column name must be shorter than or equal to '%s' characters but got '%s': '%s'", databaseMetadata.getMaxColumnNameLength(), columnName.length(), columnName));
         }
+    }
+
+    private static ColumnMapping charColumnMapping(int charLength)
+    {
+        if (charLength > CharType.MAX_LENGTH) {
+            return varcharColumnMapping(charLength);
+        }
+        CharType charType = createCharType(charLength);
+        return ColumnMapping.sliceMapping(
+                charType,
+                charReadFunction(charType),
+                charWriteFunction(),
+                SQLSERVER_STRING_COLLATION_AWARE_PUSHDOWN);
+    }
+
+    private static ColumnMapping varcharColumnMapping(int varcharLength)
+    {
+        VarcharType varcharType = varcharLength <= VarcharType.MAX_LENGTH
+                ? createVarcharType(varcharLength)
+                : createUnboundedVarcharType();
+        return ColumnMapping.sliceMapping(
+                varcharType,
+                varcharReadFunction(varcharType),
+                varcharWriteFunction(),
+                SQLSERVER_STRING_COLLATION_AWARE_PUSHDOWN);
     }
 
     @Override
@@ -451,11 +500,11 @@ public class SqlServerClient
 
             case Types.CHAR:
             case Types.NCHAR:
-                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize(), false));
+                return Optional.of(charColumnMapping(typeHandle.getRequiredColumnSize()));
 
             case Types.VARCHAR:
             case Types.NVARCHAR:
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize(), false));
+                return Optional.of(varcharColumnMapping(typeHandle.getRequiredColumnSize()));
 
             case Types.LONGVARCHAR:
             case Types.LONGNVARCHAR:
@@ -922,6 +971,24 @@ public class SqlServerClient
                     .collect(joining(", "));
             return format("%s ORDER BY %s OFFSET 0 ROWS FETCH NEXT %s ROWS ONLY", query, orderBy, limit);
         });
+    }
+
+    protected static boolean isCollatable(JdbcColumnHandle column)
+    {
+        if (column.getColumnType() instanceof CharType || column.getColumnType() instanceof VarcharType) {
+            String jdbcTypeName = column.getJdbcTypeHandle().getJdbcTypeName()
+                    .orElseThrow(() -> new TrinoException(JDBC_ERROR, "Type name is missing: " + column.getJdbcTypeHandle()));
+            return isCollatable(jdbcTypeName);
+        }
+
+        // non-textual types don't have the concept of collation
+        return false;
+    }
+
+    private static boolean isCollatable(String jdbcTypeName)
+    {
+        //TODO: check which JDBC types in SQLServer are collatable
+        return "char".equals(jdbcTypeName) || "nchar".equals(jdbcTypeName) || "varchar".equals(jdbcTypeName) || "nvarchar".equals(jdbcTypeName) || "text".equals(jdbcTypeName);
     }
 
     @Override
