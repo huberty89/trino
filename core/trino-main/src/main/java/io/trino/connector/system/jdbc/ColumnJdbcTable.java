@@ -199,6 +199,31 @@ public class ColumnJdbcTable
                     .buildOrThrow());
         }
 
+        if (schemas.size() > 100) {
+            List<CatalogSchemaTableName> tables = catalogs.stream()
+                    .flatMap(catalogName -> listTables(session, metadata, accessControl, new QualifiedTablePrefix(catalogName)).stream()
+                            .filter(schemaTableName -> predicate.test(ImmutableMap.of(
+                                    TABLE_CATALOG_COLUMN, toNullableValue(catalogName),
+                                    TABLE_SCHEMA_COLUMN, toNullableValue(schemaTableName.getSchemaName()),
+                                    TABLE_NAME_COLUMN, toNullableValue(schemaTableName.getTableName()))))
+                            .map(schemaTableName -> new CatalogSchemaTableName(catalogName, schemaTableName.getSchemaName(), schemaTableName.getTableName())))
+                    .collect(toImmutableList());
+            return TupleDomain.withColumnDomains(ImmutableMap.<ColumnHandle, Domain>builder()
+                    .put(TABLE_CATALOG_COLUMN, tables.stream()
+                            .map(CatalogSchemaTableName::getCatalogName)
+                            .collect(toVarcharDomain())
+                            .simplify(MAX_DOMAIN_SIZE))
+                    .put(TABLE_SCHEMA_COLUMN, tables.stream()
+                            .map(catalogSchemaTableName -> catalogSchemaTableName.getSchemaTableName().getSchemaName())
+                            .collect(toVarcharDomain())
+                            .simplify(MAX_DOMAIN_SIZE))
+                    .put(TABLE_NAME_COLUMN, tables.stream()
+                            .map(catalogSchemaTableName -> catalogSchemaTableName.getSchemaTableName().getTableName())
+                            .collect(toVarcharDomain())
+                            .simplify(MAX_DOMAIN_SIZE))
+                    .buildOrThrow());
+        }
+
         List<CatalogSchemaTableName> tables = schemas.stream()
                 .flatMap(schema -> {
                     QualifiedTablePrefix tablePrefix = tableFilter.isPresent()
@@ -264,6 +289,13 @@ public class ColumnJdbcTable
             }
             else {
                 Collection<String> schemas = listSchemas(session, metadata, accessControl, catalog, schemaFilter);
+
+                if (schemas.size() > 100) {
+                    Map<SchemaTableName, List<ColumnMetadata>> tableColumns = listTableColumns(session, metadata, accessControl, new QualifiedTablePrefix(catalog));
+                    addColumnsRow(table, catalog, tableColumns, omitDateTimeTypePrecision);
+                    continue;
+                }
+
                 for (String schema : schemas) {
                     if (!schemaDomain.includesNullableValue(utf8Slice(schema))) {
                         continue;

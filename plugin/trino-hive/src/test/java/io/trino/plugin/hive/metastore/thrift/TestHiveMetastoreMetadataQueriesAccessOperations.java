@@ -521,7 +521,8 @@ public class TestHiveMetastoreMetadataQueriesAccessOperations
                 allTablesViewsImplemented
                         ? ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
-                        .addCopies(GET_TABLE, TEST_SCHEMAS_COUNT)
+                        .add(GET_ALL_TABLES)
+                        .add(GET_ALL_VIEWS)
                         .build()
                         : ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
@@ -531,7 +532,8 @@ public class TestHiveMetastoreMetadataQueriesAccessOperations
                 allTablesViewsImplemented
                         ? ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
-                        .addCopies(GET_TABLE, TEST_SCHEMAS_COUNT)
+                        .add(GET_ALL_TABLES)
+                        .add(GET_ALL_VIEWS)
                         .build()
                         : ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
@@ -541,8 +543,8 @@ public class TestHiveMetastoreMetadataQueriesAccessOperations
                 allTablesViewsImplemented
                         ? ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
-                        .addCopies(GET_ALL_TABLES_FROM_DATABASE, TEST_SCHEMAS_COUNT)
-                        .addCopies(GET_TABLE, TEST_SCHEMAS_COUNT)
+                        .add(GET_ALL_TABLES)
+                        .add(GET_ALL_VIEWS)
                         .build()
                         : ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
@@ -573,7 +575,8 @@ public class TestHiveMetastoreMetadataQueriesAccessOperations
                 allTablesViewsImplemented
                         ? ImmutableMultiset.builder()
                         .add(GET_ALL_DATABASES)
-                        .addCopies(GET_ALL_TABLES_FROM_DATABASE, TEST_SCHEMAS_COUNT)
+                        .add(GET_ALL_TABLES)
+                        .add(GET_ALL_VIEWS)
                         .addCopies(GET_TABLE, TEST_ALL_TABLES_COUNT)
                         .build()
                         : ImmutableMultiset.builder()
